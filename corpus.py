@@ -47,6 +47,19 @@ from dataclasses import dataclass, field
 # makes the author stop does not get filled in — which costs the whole index.
 DEPTHS = ("aware", "walkthrough", "practice")
 
+# A FOURTH value that is deliberately NOT a depth: it is the absence of one.
+# chunk.py writes it because inferring a depth from wording would manufacture a
+# fully-annotated-looking corpus out of content no human has classified. A chunk
+# marked this way IS indexed and IS searchable — hiding it would be worse, since
+# the content genuinely exists — but every hit says so, and the coverage line
+# counts them. Kept out of DEPTHS so it can never be read as a real level.
+UNREVIEWED = "unreviewed"
+VALID_DEPTHS = DEPTHS + (UNREVIEWED,)
+
+# Sorts unreviewed LAST rather than raising. Using DEPTHS.index() directly here
+# would crash on an unreviewed chunk, which is the common case in a fresh corpus.
+_DEPTH_ORDER = {level: index for index, level in enumerate(VALID_DEPTHS)}
+
 # Fields a header must carry to count as indexed. `verified` is deliberately NOT
 # required: its absence is meaningful (rule 2) and demanding it would push
 # authors into inventing a date to satisfy the parser.
@@ -81,6 +94,15 @@ class Chunk:
     written: str
     verified: str | None
     body: str
+    # Optional, written by chunk.py. A chunk from a hand-made file has none of
+    # these and must still index — so they default rather than being required.
+    duration_min: float | None = None
+    source: str | None = None
+    title: str | None = None
+
+    @property
+    def depth_is_unreviewed(self) -> bool:
+        return self.depth == UNREVIEWED
 
 
 @dataclass(frozen=True)
@@ -128,6 +150,15 @@ class SearchResult:
     unindexed: int
     files_seen: int
     stale_after_days: int
+
+    @property
+    def unreviewed_depth(self) -> int:
+        """Hits whose depth no human has set. Reported, never hidden."""
+        return sum(1 for h in self.hits if h.chunk.depth_is_unreviewed)
+
+    @property
+    def unknown_currency(self) -> int:
+        return sum(1 for h in self.hits if h.currency == UNKNOWN)
 
 
 @dataclass(frozen=True)
@@ -179,15 +210,25 @@ def load_chunk(path: str, text: str) -> Chunk | Problem:
         return Problem(path=path, reason="no header block")
 
     depth = fields["depth"].lower()
-    if depth not in DEPTHS:
+    if depth not in VALID_DEPTHS:
         return Problem(
             path=path,
-            reason="depth %r is not one of %s" % (depth, ", ".join(DEPTHS)),
+            reason="depth %r is not one of %s" % (depth, ", ".join(VALID_DEPTHS)),
         )
 
     topics = tuple(t.strip() for t in fields["topics"].split(",") if t.strip())
     if not topics:
         return Problem(path=path, reason="topics field is empty")
+
+    # An unparseable duration becomes None rather than 0.0. A zero would be a
+    # claim that the lesson is instant, and it would quietly skew any total.
+    duration: float | None = None
+    raw_duration = fields.get("duration_min", "").strip()
+    if raw_duration:
+        try:
+            duration = float(raw_duration)
+        except ValueError:
+            duration = None
 
     # An empty `verified:` and an absent one mean the same thing, and that thing
     # is UNKNOWN. Normalising both to None here is what makes rule 2 hold at
@@ -202,6 +243,9 @@ def load_chunk(path: str, text: str) -> Chunk | Problem:
         written=fields["written"],
         verified=verified,
         body=body,
+        duration_min=duration,
+        source=fields.get("source", "").strip() or None,
+        title=fields.get("title", "").strip() or None,
     )
 
 
@@ -304,7 +348,12 @@ def search(
 
     # Topic matches first, then shallowest depth: a hit whose header names the
     # topic is about it, where a body match may only mention it in passing.
-    hits.sort(key=lambda h: (not h.matched_topics, DEPTHS.index(h.chunk.depth)))
+    hits.sort(
+        key=lambda h: (
+            not h.matched_topics,
+            _DEPTH_ORDER.get(h.chunk.depth, len(VALID_DEPTHS)),
+        )
+    )
 
     return SearchResult(
         query=query,
@@ -333,8 +382,14 @@ def format_inventory(inv: Inventory) -> str:
         for chunk in inv.chunks:
             by_depth[chunk.depth] = by_depth.get(chunk.depth, 0) + 1
         lines.append("Indexed by depth:")
-        for level in DEPTHS:
-            lines.append("  %-12s %d" % (level, by_depth.get(level, 0)))
+        for level in VALID_DEPTHS:
+            label = level + (" (NOT SET)" if level == UNREVIEWED else "")
+            lines.append("  %-22s %d" % (label, by_depth.get(level, 0)))
+        total_minutes = sum(
+            c.duration_min for c in inv.chunks if c.duration_min is not None
+        )
+        if total_minutes:
+            lines.append("  %-22s %g" % ("stated minutes", total_minutes))
         lines.append("")
     if inv.problems:
         lines.append("Not indexed, with reasons:")
@@ -362,14 +417,22 @@ def format_search(result: SearchResult) -> str:
             chunk = hit.chunk
             where = "topic" if hit.matched_topics else "body only"
             lines.append("  %s" % chunk.path)
-            lines.append(
-                "      depth %-11s audience: %s" % (chunk.depth, chunk.audience)
+            depth_note = (
+                "depth NOT SET BY A HUMAN"
+                if chunk.depth_is_unreviewed
+                else "depth %s" % chunk.depth
             )
+            lines.append("      %-26s audience: %s" % (depth_note, chunk.audience))
             lines.append(
                 "      written %s   verified %s   %s"
                 % (chunk.written, chunk.verified or "never", hit.currency)
             )
-            lines.append("      matched on %s" % where)
+            extra = ["matched on %s" % where]
+            if chunk.duration_min is not None:
+                extra.append("%g min" % chunk.duration_min)
+            if chunk.source:
+                extra.append("from %s" % chunk.source)
+            lines.append("      %s" % "   ".join(extra))
             lines.append("")
 
     # Rule 3. This line is printed on EVERY result, including a successful one:
@@ -392,6 +455,19 @@ def format_search(result: SearchResult) -> str:
         "has recorded a check — it is NOT a clean bill of health."
         % result.stale_after_days
     )
+    if result.hits:
+        # Both of these are absences, and both are printed as counts rather than
+        # left for the reader to tally off the list above. A result where every
+        # depth is unset still LOOKS like a populated index.
+        lines.append(
+            "Annotation: %d of %d hit(s) have no human-set depth; %d have no "
+            "recorded verification."
+            % (
+                result.unreviewed_depth,
+                len(result.hits),
+                result.unknown_currency,
+            )
+        )
     return "\n".join(lines)
 
 

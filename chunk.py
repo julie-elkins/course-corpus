@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Split one exported course script into per-lesson chunks.
+
+Reads ONE named file and writes one chunk file per lesson, with the header block
+pre-filled as far as can be done honestly. Everything that needs a human
+judgement is left visibly unset rather than guessed.
+
+Design rules, in force throughout this module:
+
+1. ONE NAMED INPUT FILE, never a directory sweep. The module has no discovery
+   path at all. A sweep over a documents folder would eventually index whatever
+   else is in that folder, and the failure is silent: a correctly indexed file
+   looks identical to one that should never have been read.
+2. DEPTH IS NEVER GUESSED. A chunk is written with `depth: unreviewed`, which
+   indexes and searches but reports as unreviewed on every hit. Inferring a depth
+   from wording would manufacture exactly the confidence this tool exists to
+   deny, and the resulting corpus would look fully annotated.
+3. `verified:` IS ALWAYS EMPTY. Nobody has checked this content at the moment it
+   is chunked, and a date here would be the one lie that matters.
+4. `written:` IS REQUIRED FROM THE CALLER. Today's date is when the split ran,
+   not when the content was written, and defaulting to it would silently restate
+   old material as new — which would then read as CURRENT for a year.
+5. REFUSES TO WRITE INTO A GIT WORKING TREE unless explicitly overridden. Course
+   content does not belong in a repository, and the single worst outcome
+   available here is a commit that publishes unreleased material. A `.gitignore`
+   entry is a convention; this is a check.
+6. No part of a chunk's body is ever printed. The output is counts and titles.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from dataclasses import dataclass
+
+# OBSERVED 2026-10-17 on a 3,557-line exported exam-prep script: every lesson
+# boundary in that document is a heading line ending in a parenthesised duration
+# ("Walkthrough example (5 minutes)"), 62 of them, and no other line shape marks
+# a lesson. Slide markers exist but cover only 22 lines of the document, so they
+# cannot carry the split.
+LESSON_HEADING = re.compile(
+    r"^(?P<title>.{3,120}?)\s*\(\s*(?P<mins>\d+(?:\.\d+)?)\s*(?:minutes?|mins?|min)\s*\)\s*$"
+)
+
+# Written into every chunk. corpus.py indexes this and flags it on each hit.
+UNREVIEWED = "unreviewed"
+
+_SLUG_STRIP = re.compile(r"[^a-z0-9]+")
+
+
+@dataclass(frozen=True)
+class Lesson:
+    """One lesson's heading, duration and body line range."""
+
+    title: str
+    duration_min: float
+    start_line: int
+    body: str
+
+
+@dataclass(frozen=True)
+class Refusal:
+    error: str
+    message: str
+    guidance: str
+
+
+def slugify(title: str, taken: set[str]) -> str:
+    """Make a filename from a title, without colliding with one already used."""
+    base = _SLUG_STRIP.sub("-", title.lower()).strip("-") or "lesson"
+    base = base[:70].strip("-")
+    slug = base
+    suffix = 2
+    while slug in taken:
+        slug = "%s-%d" % (base, suffix)
+        suffix += 1
+    taken.add(slug)
+    return slug
+
+
+def find_lessons(text: str) -> tuple[tuple[Lesson, ...], int]:
+    """Split text at lesson headings.
+
+    Returns the lessons and the count of lines appearing BEFORE the first
+    heading. That preamble is reported rather than attached to lesson one: it is
+    usually front matter, and silently folding it into the first chunk would
+    misattribute it.
+    """
+    lines = text.splitlines()
+    marks: list[tuple[int, str, float]] = []
+    for index, line in enumerate(lines):
+        match = LESSON_HEADING.match(line)
+        if match:
+            marks.append(
+                (index, match.group("title").strip(), float(match.group("mins")))
+            )
+
+    if not marks:
+        return (), len(lines)
+
+    lessons: list[Lesson] = []
+    for position, (index, title, mins) in enumerate(marks):
+        end = marks[position + 1][0] if position + 1 < len(marks) else len(lines)
+        body = "\n".join(lines[index + 1 : end]).strip("\n")
+        lessons.append(
+            Lesson(
+                title=title,
+                duration_min=mins,
+                start_line=index + 1,
+                body=body,
+            )
+        )
+    return tuple(lessons), marks[0][0]
+
+
+def derive_topics(title: str) -> str:
+    """Derive a topics line from the lesson title.
+
+    This is a RESTATEMENT of the title, not a judgement about content, which is
+    why it is allowed where depth is not. Stopwords are dropped so that a title
+    like "What is machine learning?" yields "machine learning" rather than four
+    useless terms. The author is expected to correct it; the README says so.
+    """
+    stop = {
+        "a", "an", "and", "are", "as", "at", "by", "для", "for", "from", "how",
+        "in", "into", "is", "of", "on", "or", "part", "the", "to", "what",
+        "with", "your", "you", "introduction", "intro", "overview",
+    }
+    words = [w for w in _SLUG_STRIP.sub(" ", title.lower()).split() if w]
+    kept = [w for w in words if w not in stop and not w.isdigit()]
+    return ", ".join(kept[:6]) if kept else title.lower()
+
+
+def render_chunk(
+    lesson: Lesson, written: str, audience: str, source: str
+) -> str:
+    """Build one chunk file's text. `verified` is deliberately empty (rule 3)."""
+    header = [
+        "---",
+        "topics: %s" % derive_topics(lesson.title),
+        "depth: %s" % UNREVIEWED,
+        "audience: %s" % audience,
+        "written: %s" % written,
+        "verified:",
+        "duration_min: %s" % (
+            int(lesson.duration_min)
+            if lesson.duration_min == int(lesson.duration_min)
+            else lesson.duration_min
+        ),
+        "source: %s" % source,
+        "title: %s" % lesson.title,
+        "---",
+        "",
+    ]
+    return "\n".join(header) + lesson.body + "\n"
+
+
+def inside_git_work_tree(path: str) -> str | None:
+    """Return the repository root if `path` sits inside one, else None.
+
+    Walks up looking for `.git`, which may be a directory OR a file — a worktree
+    records it as a file, so an `isdir` check here would miss live work.
+    """
+    current = os.path.abspath(path)
+    while True:
+        if os.path.exists(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def chunk_file(
+    source_path: str,
+    out_dir: str,
+    written: str,
+    audience: str,
+    allow_in_git_repo: bool = False,
+    dry_run: bool = False,
+) -> dict | Refusal:
+    """Split one named file into per-lesson chunks under out_dir."""
+    if not os.path.isfile(source_path):
+        return Refusal(
+            error="source_not_found",
+            message="No file at %r." % source_path,
+            guidance=(
+                "Export the document to plain text first, then pass the path to "
+                "that single file. This tool reads one named file and never "
+                "searches a folder."
+            ),
+        )
+
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", written):
+        return Refusal(
+            error="written_date_invalid",
+            message="--written must be YYYY-MM-DD, got %r." % written,
+            guidance=(
+                "Pass the date the SOURCE content was written, not today's "
+                "date. Today's date would restate old material as new, and it "
+                "would then read as CURRENT for a year."
+            ),
+        )
+
+    repo_root = inside_git_work_tree(out_dir if os.path.isdir(out_dir) else os.path.dirname(os.path.abspath(out_dir)))
+    if repo_root and not allow_in_git_repo:
+        return Refusal(
+            error="destination_inside_git_repo",
+            message="%s is inside the git repository at %s." % (out_dir, repo_root),
+            guidance=(
+                "Choose a destination outside any repository, e.g. "
+                "~/course-corpus-content/. Course content does not belong in "
+                "version control here, and a .gitignore entry is a convention "
+                "rather than a check. Pass --allow-in-git-repo only if you are "
+                "certain the content is publishable."
+            ),
+        )
+
+    try:
+        with open(source_path, "r", encoding="utf-8-sig") as handle:
+            text = handle.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        return Refusal(
+            error="source_unreadable",
+            message="Could not read %r: %s" % (source_path, exc),
+            guidance="Check the file is plain text, not .docx or .pdf.",
+        )
+
+    lessons, preamble_lines = find_lessons(text)
+    if not lessons:
+        return Refusal(
+            error="no_lesson_boundaries",
+            message=(
+                "Found no lesson headings in %s. This splitter looks for a "
+                "heading line ending in a parenthesised duration." % source_path
+            ),
+            guidance=(
+                "Check the export kept its headings, or split this document by "
+                "hand. Writing one chunk for the whole document would produce a "
+                "file too large for a search hit to be useful."
+            ),
+        )
+
+    source_name = os.path.basename(source_path)
+    taken: set[str] = set()
+    written_files: list[tuple[str, float]] = []
+
+    if not dry_run:
+        os.makedirs(out_dir, exist_ok=True)
+
+    for lesson in lessons:
+        slug = slugify(lesson.title, taken)
+        path = os.path.join(out_dir, slug + ".md")
+        if not dry_run:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    render_chunk(lesson, written, audience, source_name)
+                )
+        written_files.append((path, lesson.duration_min))
+
+    return {
+        "source": source_path,
+        "out_dir": out_dir,
+        "lessons": len(lessons),
+        "total_minutes": round(sum(l.duration_min for l in lessons), 1),
+        "preamble_lines_not_chunked": preamble_lines,
+        "files": written_files,
+        "dry_run": dry_run,
+    }
+
+
+def format_result(result: dict) -> str:
+    lines = [
+        "%s %d lesson(s) from %s"
+        % ("Would write" if result["dry_run"] else "Wrote", result["lessons"],
+           result["source"]),
+        "Destination: %s" % result["out_dir"],
+        "Stated duration: %s minutes total" % result["total_minutes"],
+    ]
+    if result["preamble_lines_not_chunked"]:
+        lines.append(
+            "NOT chunked: %d line(s) before the first lesson heading. Front "
+            "matter is reported rather than folded into lesson one."
+            % result["preamble_lines_not_chunked"]
+        )
+    lines.append("")
+    lines.append(
+        "Every chunk was written with depth: %s and an EMPTY verified date."
+        % UNREVIEWED
+    )
+    lines.append(
+        "Neither was guessed. Until a human sets them, a search will find these "
+        "chunks and report them as unreviewed and UNKNOWN."
+    )
+    return "\n".join(lines)
+
+
+def format_refusal(refusal: Refusal) -> str:
+    return "\n".join(
+        ["Refused: %s" % refusal.error, refusal.message,
+         "Next: %s" % refusal.guidance]
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="chunk.py",
+        description=(
+            "Split ONE exported course script into per-lesson chunks. Reads one "
+            "named file; it cannot search a folder."
+        ),
+    )
+    parser.add_argument("source", help="path to one exported plain-text script")
+    parser.add_argument("out_dir", help="destination directory for the chunks")
+    parser.add_argument(
+        "--written",
+        required=True,
+        metavar="YYYY-MM-DD",
+        help="date the SOURCE content was written (not today)",
+    )
+    parser.add_argument(
+        "--audience",
+        required=True,
+        help="who the content was written for, e.g. 'MLA-C01 candidates'",
+    )
+    parser.add_argument(
+        "--allow-in-git-repo",
+        action="store_true",
+        help="permit writing inside a git working tree (default: refuse)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be written without writing it",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    result = chunk_file(
+        source_path=args.source,
+        out_dir=args.out_dir,
+        written=args.written,
+        audience=args.audience,
+        allow_in_git_repo=args.allow_in_git_repo,
+        dry_run=args.dry_run,
+    )
+    if isinstance(result, Refusal):
+        print(format_refusal(result), file=sys.stderr)
+        return 2
+    print(format_result(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

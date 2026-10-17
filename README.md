@@ -123,6 +123,59 @@ That coverage line prints on every result, including successful ones and includi
 empty ones. An empty hit list and an unreadable corpus are indistinguishable
 without it, and the mistake always runs in the reassuring direction.
 
+## Splitting an existing course into chunks
+
+`chunk.py` turns one exported course script into one file per lesson. It reads
+**one named file** and has no way to search a folder — a sweep over a documents
+directory eventually indexes whatever else is in that directory, and that failure
+is silent, because a correctly indexed file looks identical to one that should
+never have been read.
+
+```
+python3 chunk.py ./my-course.txt ~/course-content/my-course \
+  --written 2025-11-18 --audience "MLA-C01 candidates"
+```
+
+It splits at lesson headings — a line ending in a parenthesised duration, like
+`Walkthrough example (5 minutes)` — and writes `duration_min`, `source` and
+`title` alongside the five core fields.
+
+Three things it refuses to do, each because the alternative is a tool that lies:
+
+- **It never guesses `depth`.** Every chunk is written `depth: unreviewed`, which
+  indexes and searches but reports `depth NOT SET BY A HUMAN` on every hit, and is
+  counted on every result. Inferring depth from wording would produce a corpus
+  that looks fully annotated and is not.
+- **It never writes a `verified` date.** Nobody has checked the content at the
+  moment it is split.
+- **It will not default `--written` to today.** Today is when the split ran, not
+  when the content was written. Defaulting would restate old material as new, and
+  it would then read as `CURRENT` for a year.
+
+It also **refuses to write into a git working tree** unless you pass
+`--allow-in-git-repo`. Course content does not belong in a repository, and a
+`.gitignore` entry is a convention where this is a check.
+
+## A measured limitation you will hit immediately
+
+Derived topics are only as good as your lesson titles, and on a real exam-prep
+script they were mostly useless.
+
+Measured on a 62-lesson course: **57 of 62 titles were structural codes** —
+`Domain 2 introduction`, `TS 4.3 part 2`, `Module 1: Course introduction` — which
+derive to topics like `domain` and `module`. Only 5 titles named their subject
+("Machine Learning Lifecycle", "Types of machine learning"). So a search for a
+real topic matched on body text rather than on topics for almost every hit, and a
+broad term matched 56 of 62 chunks: the forty-equally-weighted-hits problem this
+tool is supposed to solve, reproduced inside it.
+
+The honest reading: after splitting, the corpus is **indexed and not yet useful**.
+Two things close the gap, and neither is automatable. Topics have to come from
+something other than the title — the services and concepts the body names, or the
+curriculum document the codes refer to. And depth has to be set by a person, 62
+times. The tool is built to make that state visible rather than to pretend it has
+been done.
+
 ## Design rules
 
 1. **Read-only.** Nothing writes to, moves or renames a file in your corpus.

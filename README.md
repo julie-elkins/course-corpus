@@ -195,6 +195,42 @@ once per chunk, and the scan picks up some adjectives (`cost-efficient`,
 `real-time`) alongside real subjects. The tool is built to make that state visible
 rather than to pretend the work has been done.
 
+## Setting depth, once a person has judged it
+
+Splitting leaves every chunk `depth: unreviewed`. `annotate.py` lets a human set
+those without opening every file:
+
+```
+python3 annotate.py worksheet ~/course-content/my-course depths.tsv
+# fill in the new_depth column
+python3 annotate.py apply ~/course-content/my-course depths.tsv
+```
+
+The worksheet carries each chunk's title, duration, extracted topics and
+`topics_basis` as context, and **the `new_depth` column is emitted blank.** It is
+not pre-filled with a suggestion, and that is deliberate rather than lazy: a
+candidate value offered alongside a judgement is not neutral. In a separate
+measurement on a different tool, showing a reviewer a menu of candidates moved
+agreement with those candidates from 49% to 92% — the menu was doing the deciding.
+Pre-filling a depth would produce a corpus of values a person clicked past, which
+is the same corpus an inferred depth would produce, arrived at more slowly.
+
+Four things it will not do:
+
+- **A blank row is left alone, never defaulted.** An unmade judgement stays
+  visibly unmade; a default would classify every row you skipped.
+- **It never touches `verified`.** Classifying a chunk is not the same act as
+  checking it, and a tool that set both would let one pass for the other.
+- **It edits the header only.** A body line that happens to begin `depth:` is
+  narration, not metadata.
+- **It reports what it did not do** — rows left blank, slugs not found, values
+  refused — counted and printed even when zero, so a partial run cannot read as a
+  complete one.
+
+The writer lives in its own module so that `corpus.py` keeps having **no write
+surface at all**, which is asserted by a test in each of two files. That
+invariant is worth more than the convenience of one fewer file.
+
 ## Design rules
 
 1. **Read-only.** Nothing writes to, moves or renames a file in your corpus.

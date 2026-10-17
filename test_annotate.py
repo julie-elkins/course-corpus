@@ -11,6 +11,7 @@ Runs under stdlib unittest and under pytest. All dates pinned.
 
 from __future__ import annotations
 
+import csv
 import os
 import re
 import tempfile
@@ -196,6 +197,74 @@ class TestApply(_Corpus):
         )
         self.assertIsInstance(refused, annotate.Refusal)
         self.assertEqual(refused.error, "worksheet_not_found")
+
+
+class TestDelimiterHandling(_Corpus):
+    """Chosen by extension on write, DETECTED on read.
+
+    MEASURED 2026-10-17 on macOS: nothing is registered to handle `.tsv`, so
+    `open file.tsv` does nothing at all — no app, no error message. That silent
+    failure is what this is for.
+    """
+
+    def test_csv_extension_produces_commas(self):
+        out = os.path.join(self.tmp.name, "depths.csv")
+        annotate.write_worksheet(self.dir, out)
+        with open(out, encoding="utf-8") as handle:
+            header = handle.readline()
+        self.assertIn(",", header)
+        self.assertNotIn("\t", header)
+
+    def test_tsv_extension_still_produces_tabs(self):
+        annotate.write_worksheet(self.dir, self.sheet)
+        with open(self.sheet, encoding="utf-8") as handle:
+            self.assertIn("\t", handle.readline())
+
+    def test_commas_inside_topics_survive_a_csv_round_trip(self):
+        # The reason tab was the original default: the topics column contains
+        # commas. If quoting were wrong, the columns would shift and new_depth
+        # would be read from the wrong cell — which would set depths against the
+        # wrong chunks and look entirely successful.
+        out = os.path.join(self.tmp.name, "depths.csv")
+        annotate.write_worksheet(self.dir, out)
+        with open(out, encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(rows[0]["topics"], "sagemaker, s3")
+        self.assertEqual(rows[0]["current_depth"], "unreviewed")
+
+    def test_apply_reads_a_csv_worksheet(self):
+        out = os.path.join(self.tmp.name, "depths.csv")
+        annotate.write_worksheet(self.dir, out)
+        with open(out, encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        for row in rows:
+            row["new_depth"] = "practice"
+        with open(out, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=annotate.FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        result = annotate.apply_worksheet(self.dir, out)
+        self.assertEqual(result["set"], 2)
+        self.assertIn("depth: practice", self.read("ts-4-3-part-2"))
+
+    def test_a_tsv_named_file_saved_as_csv_is_still_read(self):
+        # Excel will save a file called .tsv with commas. Sniffing the header
+        # rather than trusting the extension is what makes that survive instead
+        # of being refused as malformed.
+        annotate.write_worksheet(self.dir, self.sheet)
+        with open(self.sheet, encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle, delimiter="\t"))
+        for row in rows:
+            row["new_depth"] = "aware"
+        with open(self.sheet, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=annotate.FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        self.assertEqual(annotate.sniff_delimiter(self.sheet), ",")
+        result = annotate.apply_worksheet(self.dir, self.sheet)
+        self.assertEqual(result["set"], 2)
 
 
 class TestCorpusStillHasNoWriteSurface(unittest.TestCase):

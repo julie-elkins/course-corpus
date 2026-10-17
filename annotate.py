@@ -49,6 +49,37 @@ FIELDS = ("slug", "current_depth", "new_depth", "duration_min", "topics_basis",
 _HEADER_DEPTH = re.compile(r"^depth:.*$", re.MULTILINE)
 
 
+def delimiter_for(path: str) -> str:
+    """Tab or comma, chosen by extension.
+
+    MEASURED 2026-10-17 on macOS: nothing is registered to handle `.tsv`, so
+    `open file.tsv` fails SILENTLY — no app, no error. A `.csv` opens in Excel on
+    a double-click. Tab remains the default because the topics column contains
+    commas, but a corpus owner who wants to edit in a spreadsheet should not have
+    to know that.
+    """
+    return "," if path.lower().endswith(".csv") else "\t"
+
+
+def sniff_delimiter(path: str) -> str:
+    """Detect the delimiter of an existing worksheet from its header row.
+
+    Detected rather than assumed from the extension, because Excel will happily
+    save a file named .tsv as comma-separated. Reading the header is cheap and it
+    is the only line guaranteed to contain a delimiter.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            header = handle.readline()
+    except OSError:
+        return "\t"
+    if "\t" in header:
+        return "\t"
+    if "," in header:
+        return ","
+    return "\t"
+
+
 @dataclass(frozen=True)
 class Refusal:
     error: str
@@ -88,7 +119,9 @@ def write_worksheet(corpus_dir: str, out_path: str) -> dict | Refusal:
     # Tab-separated, not comma: the topics column contains commas, and a CSV
     # here would need quoting that a spreadsheet round-trip tends to mangle.
     with open(out_path, "w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=FIELDS, delimiter="\t")
+        writer = csv.DictWriter(
+            handle, fieldnames=FIELDS, delimiter=delimiter_for(out_path)
+        )
         writer.writeheader()
         writer.writerows(rows)
 
@@ -117,7 +150,7 @@ def apply_worksheet(corpus_dir: str, in_path: str) -> dict | Refusal:
         )
 
     with open(in_path, "r", encoding="utf-8", newline="") as handle:
-        rows = list(csv.DictReader(handle, delimiter="\t"))
+        rows = list(csv.DictReader(handle, delimiter=sniff_delimiter(in_path)))
 
     if not rows or "new_depth" not in (rows[0].keys() if rows else {}):
         return Refusal(
@@ -242,7 +275,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     ws = sub.add_parser("worksheet", help="emit a worksheet of chunks to judge")
     ws.add_argument("corpus", help="path to the corpus directory")
-    ws.add_argument("out_path", help="worksheet file to write (.tsv)")
+    ws.add_argument(
+        "out_path",
+        help="worksheet file to write; .csv opens in Excel, .tsv does not",
+    )
 
     ap = sub.add_parser("apply", help="write filled-in depths back into chunks")
     ap.add_argument("corpus", help="path to the corpus directory")

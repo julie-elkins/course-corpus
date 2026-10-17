@@ -397,3 +397,55 @@ class TestCorpusStillHasNoWriteSurface(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPerFieldCounts(unittest.TestCase):
+    """The report must say WHICH field moved.
+
+    Regression. MEASURED 2026-10-17: applying 62 written dates to an
+    already-classified corpus printed "Depth set: 62" when no depth had
+    changed. One total labelled as one field is a lie the moment the tool sets
+    more than one field, and it reads as confirmation of work nobody did.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = os.path.join(self.tmp.name, "chunks")
+        os.makedirs(self.dir)
+        with open(os.path.join(self.dir, "a.md"), "w", encoding="utf-8") as h:
+            h.write(CHUNK)
+        self.sheet = os.path.join(self.tmp.name, "s.tsv")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _sheet(self, row):
+        with open(self.sheet, "w", encoding="utf-8", newline="") as h:
+            h.write("\t".join(annotate.FIELDS) + "\n")
+            h.write("\t".join(row.get(f, "") for f in annotate.FIELDS) + "\n")
+
+    def test_a_written_only_change_reports_zero_depths_set(self):
+        self._sheet({"slug": "a", "new_written": "2025-09-05"})
+        result = annotate.apply_worksheet(self.dir, self.sheet)
+        self.assertEqual(result["set"], 1)
+        self.assertEqual(result["per_field"].get("depth", 0), 0)
+        self.assertEqual(result["per_field"]["written"], 1)
+        rendered = annotate.format_apply(result)
+        self.assertIn("depth set:     0", rendered)
+        self.assertIn("written set:   1", rendered)
+
+    def test_a_depth_only_change_reports_zero_dates_set(self):
+        self._sheet({"slug": "a", "new_depth": "practice"})
+        result = annotate.apply_worksheet(self.dir, self.sheet)
+        self.assertEqual(result["per_field"]["depth"], 1)
+        self.assertEqual(result["per_field"].get("written", 0), 0)
+        self.assertEqual(result["per_field"].get("verified", 0), 0)
+
+    def test_a_field_resupplied_unchanged_is_not_counted(self):
+        # The fixture already says written: 2025-11-18. Supplying it again
+        # must not inflate the written count.
+        self._sheet({"slug": "a", "new_depth": "aware",
+                     "new_written": "2025-11-18"})
+        result = annotate.apply_worksheet(self.dir, self.sheet)
+        self.assertEqual(result["per_field"]["depth"], 1)
+        self.assertEqual(result["per_field"].get("written", 0), 0)

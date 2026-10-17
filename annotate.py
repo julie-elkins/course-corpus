@@ -182,6 +182,10 @@ def apply_worksheet(corpus_dir: str, in_path: str) -> dict | Refusal:
 
     set_count = 0
     unchanged = 0
+    # Counted PER FIELD. A single total labelled "depth set" reported 62 when
+    # only the written dates had moved -- the exact flattering mislabel this
+    # repository exists to avoid, produced by its own output.
+    per_field: dict[str, int] = {}
     blank: list[str] = []
     missing: list[str] = []
     refused: list[str] = []
@@ -196,13 +200,13 @@ def apply_worksheet(corpus_dir: str, in_path: str) -> dict | Refusal:
         # Each entry: column, header regex, replacement line, or a refusal
         # reason. Collected BEFORE anything is written, so a row with one bad
         # value changes nothing at all rather than landing half of its edits.
-        edits: list[tuple[re.Pattern[str], str]] = []
+        edits: list[tuple[re.Pattern[str], str, str]] = []
         problems: list[str] = []
 
         depth = (row.get("new_depth") or "").strip().lower()
         if depth:
             if depth in SETTABLE:
-                edits.append((_HEADER_DEPTH, "depth: %s" % depth))
+                edits.append((_HEADER_DEPTH, "depth: %s" % depth, "depth"))
             else:
                 problems.append("depth %r not one of %s"
                                 % (depth, ", ".join(SETTABLE)))
@@ -217,7 +221,7 @@ def apply_worksheet(corpus_dir: str, in_path: str) -> dict | Refusal:
             if field == "verified" and value.lower() == CLEAR:
                 # Only `verified` may be cleared: withdrawing a confirmation is
                 # a real statement, where an unwritten date is not.
-                edits.append((pattern, "verified:"))
+                edits.append((pattern, "verified:", field))
                 continue
             if not _ISO_DATE.match(value):
                 problems.append("%s %r is not YYYY-MM-DD" % (field, value))
@@ -233,7 +237,7 @@ def apply_worksheet(corpus_dir: str, in_path: str) -> dict | Refusal:
                 # it as UNKNOWN anyway — refusing here says why.
                 problems.append("%s %s is in the future" % (field, value))
                 continue
-            edits.append((pattern, "%s: %s" % (field, value)))
+            edits.append((pattern, "%s: %s" % (field, value), field))
 
         if problems:
             refused.append("%s (%s)" % (slug, "; ".join(problems)))
@@ -258,11 +262,15 @@ def apply_worksheet(corpus_dir: str, in_path: str) -> dict | Refusal:
         header, rest = split
         new_header = header
         failed = None
-        for pattern, replacement in edits:
+        touched: list[str] = []
+        for pattern, replacement, field in edits:
+            before = new_header
             new_header, count = pattern.subn(replacement, new_header, count=1)
             if count != 1:
-                failed = replacement.split(":")[0]
+                failed = field
                 break
+            if new_header != before:
+                touched.append(field)
         if failed:
             refused.append("%s (no %s line in header)" % (slug, failed))
             continue
@@ -274,9 +282,12 @@ def apply_worksheet(corpus_dir: str, in_path: str) -> dict | Refusal:
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(new_header + rest)
         set_count += 1
+        for field in touched:
+            per_field[field] = per_field.get(field, 0) + 1
 
     return {
         "set": set_count,
+        "per_field": per_field,
         "unchanged": unchanged,
         "left_blank": blank,
         "slug_not_found": missing,
@@ -312,7 +323,10 @@ def format_worksheet(result: dict) -> str:
 def format_apply(result: dict) -> str:
     lines = [
         "Read %d row(s)." % result["rows"],
-        "Depth set:      %d" % result["set"],
+        "Chunks changed: %d" % result["set"],
+        "  depth set:     %d" % result.get("per_field", {}).get("depth", 0),
+        "  written set:   %d" % result.get("per_field", {}).get("written", 0),
+        "  verified set:  %d" % result.get("per_field", {}).get("verified", 0),
         "Already correct: %d" % result["unchanged"],
         "Left blank:      %d  (no judgement made, nothing written)"
         % len(result["left_blank"]),

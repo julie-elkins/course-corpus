@@ -12,6 +12,7 @@ Runs under stdlib unittest and under pytest. All dates pinned.
 from __future__ import annotations
 
 import csv
+import datetime as dt
 import os
 import re
 import tempfile
@@ -197,6 +198,112 @@ class TestApply(_Corpus):
         )
         self.assertIsInstance(refused, annotate.Refusal)
         self.assertEqual(refused.error, "worksheet_not_found")
+
+
+class TestDates(_Corpus):
+    """`written` and `verified` are settable; neither may be invented."""
+
+    def field(self, slug: str, name: str) -> str | None:
+        return getattr(corpus.load_chunk("x.md", self.read(slug)), name)
+
+    def test_sets_a_written_date(self):
+        # Deliberately NOT the fixture's own 2025-11-18: re-supplying the
+        # existing value is the idempotent path and reports `unchanged`, which
+        # would make this test pass for the wrong reason.
+        self.write_sheet([{"slug": "ts-4-3-part-2", "new_written": "2025-10-01"}])
+        result = annotate.apply_worksheet(self.dir, self.sheet)
+        self.assertEqual(result["set"], 1)
+        self.assertEqual(self.field("ts-4-3-part-2", "written"), "2025-10-01")
+
+    def test_resupplying_an_existing_date_is_unchanged_not_set(self):
+        self.write_sheet([{"slug": "ts-4-3-part-2", "new_written": "2025-11-18"}])
+        result = annotate.apply_worksheet(self.dir, self.sheet)
+        self.assertEqual(result["set"], 0)
+        self.assertEqual(result["unchanged"], 1)
+
+    def test_sets_a_verified_date_and_the_currency_follows(self):
+        self.write_sheet([{"slug": "ts-4-3-part-2", "new_verified": "2026-09-30"}])
+        annotate.apply_worksheet(self.dir, self.sheet)
+        chunk = corpus.load_chunk("x.md", self.read("ts-4-3-part-2"))
+        self.assertEqual(chunk.verified, "2026-09-30")
+        self.assertEqual(
+            corpus.currency(chunk.verified, dt.date(2026, 10, 17), 365),
+            corpus.CURRENT,
+        )
+
+    def test_future_date_is_refused_not_stored(self):
+        # A future date is a typo. Accepting it would make the most careless
+        # row the most trusted row in the corpus.
+        self.write_sheet([{"slug": "ts-4-3-part-2", "new_verified": "2099-01-01"}])
+        result = annotate.apply_worksheet(self.dir, self.sheet)
+        self.assertEqual(result["set"], 0)
+        self.assertIn("in the future", result["refused"][0])
+        self.assertIsNone(self.field("ts-4-3-part-2", "verified"))
+
+    def test_malformed_dates_are_refused(self):
+        for bad in ("18/11/2025", "Nov 2025", "2025-13-01", "2025-11"):
+            self.write_sheet([{"slug": "ts-4-3-part-2", "new_written": bad}])
+            result = annotate.apply_worksheet(self.dir, self.sheet)
+            self.assertEqual(result["set"], 0, bad)
+            self.assertEqual(self.field("ts-4-3-part-2", "written"), "2025-11-18")
+
+    def test_the_word_none_withdraws_a_verification(self):
+        self.write_sheet([{"slug": "ts-4-3-part-2", "new_verified": "2026-09-30"}])
+        annotate.apply_worksheet(self.dir, self.sheet)
+        self.write_sheet([{"slug": "ts-4-3-part-2", "new_verified": "none"}])
+        annotate.apply_worksheet(self.dir, self.sheet)
+        self.assertIsNone(self.field("ts-4-3-part-2", "verified"))
+        # Withdrawn is UNKNOWN, which is the honest reading -- not CURRENT.
+        self.assertEqual(
+            corpus.currency(
+                self.field("ts-4-3-part-2", "verified"),
+                dt.date(2026, 10, 17), 365,
+            ),
+            corpus.UNKNOWN,
+        )
+
+    def test_a_row_with_one_bad_value_changes_NOTHING(self):
+        # The failure guarded against: a row setting a good depth and a bad
+        # date lands the depth, reports a refusal, and leaves the operator
+        # unsure which half applied. Edits are collected before any write.
+        self.write_sheet([{
+            "slug": "ts-4-3-part-2",
+            "new_depth": "practice",
+            "new_verified": "2099-01-01",
+        }])
+        result = annotate.apply_worksheet(self.dir, self.sheet)
+        self.assertEqual(result["set"], 0)
+        self.assertEqual(len(result["refused"]), 1)
+        self.assertEqual(self.field("ts-4-3-part-2", "depth"), "unreviewed")
+        self.assertIsNone(self.field("ts-4-3-part-2", "verified"))
+
+    def test_all_three_fields_in_one_row(self):
+        self.write_sheet([{
+            "slug": "ts-4-3-part-2",
+            "new_depth": "walkthrough",
+            "new_written": "2025-11-18",
+            "new_verified": "2026-10-01",
+        }])
+        result = annotate.apply_worksheet(self.dir, self.sheet)
+        self.assertEqual(result["set"], 1)
+        self.assertEqual(self.field("ts-4-3-part-2", "depth"), "walkthrough")
+        self.assertEqual(self.field("ts-4-3-part-2", "written"), "2025-11-18")
+        self.assertEqual(self.field("ts-4-3-part-2", "verified"), "2026-10-01")
+
+    def test_blank_date_cells_leave_existing_values_alone(self):
+        self.write_sheet([{"slug": "ts-4-3-part-2", "new_depth": "aware"}])
+        annotate.apply_worksheet(self.dir, self.sheet)
+        self.assertEqual(self.field("ts-4-3-part-2", "written"), "2025-11-18")
+        self.assertIsNone(self.field("ts-4-3-part-2", "verified"))
+
+    def test_worksheet_reports_current_dates_for_context(self):
+        annotate.write_worksheet(self.dir, self.sheet)
+        with open(self.sheet, encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle, delimiter="\t"))
+        self.assertEqual(rows[0]["current_written"], "2025-11-18")
+        self.assertEqual(rows[0]["current_verified"], "")
+        self.assertEqual(rows[0]["new_written"], "")
+        self.assertEqual(rows[0]["new_verified"], "")
 
 
 class TestDelimiterHandling(_Corpus):

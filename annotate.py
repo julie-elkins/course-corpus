@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime as dt
 import os
 import re
 import sys
@@ -43,10 +44,23 @@ import corpus
 # a chunk that already carries it.
 SETTABLE = corpus.DEPTHS
 
-FIELDS = ("slug", "current_depth", "new_depth", "duration_min", "topics_basis",
-          "title", "topics")
+FIELDS = ("slug", "current_depth", "new_depth", "current_written",
+          "new_written", "current_verified", "new_verified", "duration_min",
+          "topics_basis", "title", "topics")
 
 _HEADER_DEPTH = re.compile(r"^depth:.*$", re.MULTILINE)
+_HEADER_WRITTEN = re.compile(r"^written:.*$", re.MULTILINE)
+_HEADER_VERIFIED = re.compile(r"^verified:.*$", re.MULTILINE)
+
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Each settable field: worksheet column, header pattern, and whether an
+# empty value is a legitimate answer. `verified` is the only field where
+# CLEARING it is meaningful -- "this is no longer confirmed" is a real
+# statement, and the sentinel below says it explicitly rather than relying
+# on a blank cell, which already means "no judgement made".
+CLEAR = "none"
+
 
 
 def delimiter_for(path: str) -> str:
@@ -110,6 +124,10 @@ def write_worksheet(corpus_dir: str, out_path: str) -> dict | Refusal:
             "slug": os.path.splitext(os.path.basename(chunk.path))[0],
             "current_depth": chunk.depth,
             "new_depth": "",
+            "current_written": chunk.written,
+            "new_written": "",
+            "current_verified": chunk.verified or "",
+            "new_verified": "",
             "duration_min": "" if chunk.duration_min is None else "%g" % chunk.duration_min,
             "topics_basis": chunk.topics_basis or "",
             "title": chunk.title or "",
@@ -168,18 +186,61 @@ def apply_worksheet(corpus_dir: str, in_path: str) -> dict | Refusal:
     missing: list[str] = []
     refused: list[str] = []
 
+    today = dt.date.today()
+
     for row in rows:
         slug = (row.get("slug") or "").strip()
-        wanted = (row.get("new_depth") or "").strip().lower()
         if not slug:
             continue
-        if not wanted:
+
+        # Each entry: column, header regex, replacement line, or a refusal
+        # reason. Collected BEFORE anything is written, so a row with one bad
+        # value changes nothing at all rather than landing half of its edits.
+        edits: list[tuple[re.Pattern[str], str]] = []
+        problems: list[str] = []
+
+        depth = (row.get("new_depth") or "").strip().lower()
+        if depth:
+            if depth in SETTABLE:
+                edits.append((_HEADER_DEPTH, "depth: %s" % depth))
+            else:
+                problems.append("depth %r not one of %s"
+                                % (depth, ", ".join(SETTABLE)))
+
+        for column, pattern, field in (
+            ("new_written", _HEADER_WRITTEN, "written"),
+            ("new_verified", _HEADER_VERIFIED, "verified"),
+        ):
+            value = (row.get(column) or "").strip()
+            if not value:
+                continue
+            if field == "verified" and value.lower() == CLEAR:
+                # Only `verified` may be cleared: withdrawing a confirmation is
+                # a real statement, where an unwritten date is not.
+                edits.append((pattern, "verified:"))
+                continue
+            if not _ISO_DATE.match(value):
+                problems.append("%s %r is not YYYY-MM-DD" % (field, value))
+                continue
+            try:
+                parsed = dt.date.fromisoformat(value)
+            except ValueError:
+                problems.append("%s %r is not a real date" % (field, value))
+                continue
+            if parsed > today:
+                # A future date is a typo. Accepting one would make the most
+                # careless row the most trusted, and corpus.py would then read
+                # it as UNKNOWN anyway — refusing here says why.
+                problems.append("%s %s is in the future" % (field, value))
+                continue
+            edits.append((pattern, "%s: %s" % (field, value)))
+
+        if problems:
+            refused.append("%s (%s)" % (slug, "; ".join(problems)))
+            continue
+        if not edits:
             # Rule 3. An unmade judgement stays unmade.
             blank.append(slug)
-            continue
-        if wanted not in SETTABLE:
-            refused.append("%s (%r not one of %s)"
-                           % (slug, wanted, ", ".join(SETTABLE)))
             continue
 
         path = os.path.join(corpus_dir, slug + ".md")
@@ -195,13 +256,19 @@ def apply_worksheet(corpus_dir: str, in_path: str) -> dict | Refusal:
             continue
 
         header, rest = split
-        if re.search(r"^depth:\s*%s\s*$" % re.escape(wanted), header,
-                     re.MULTILINE):
-            unchanged += 1
+        new_header = header
+        failed = None
+        for pattern, replacement in edits:
+            new_header, count = pattern.subn(replacement, new_header, count=1)
+            if count != 1:
+                failed = replacement.split(":")[0]
+                break
+        if failed:
+            refused.append("%s (no %s line in header)" % (slug, failed))
             continue
-        new_header, count = _HEADER_DEPTH.subn("depth: %s" % wanted, header, count=1)
-        if count != 1:
-            refused.append("%s (no depth line in header)" % slug)
+
+        if new_header == header:
+            unchanged += 1
             continue
 
         with open(path, "w", encoding="utf-8") as handle:
@@ -223,8 +290,13 @@ def format_worksheet(result: dict) -> str:
         "Wrote %d row(s) to %s" % (result["rows"], result["out_path"]),
         "%d of them have no human-set depth." % result["unreviewed"],
         "",
-        "Fill in the new_depth column with one of: %s" % ", ".join(SETTABLE),
-        "Leave a row blank to decide it later — blanks are never defaulted.",
+        "new_depth:     one of %s" % ", ".join(SETTABLE),
+        "new_written:   YYYY-MM-DD, the date the content was WRITTEN",
+        "new_verified:  YYYY-MM-DD a human last confirmed it is still true,",
+        "               or the word 'none' to withdraw a confirmation",
+        "",
+        "Leave a cell blank to decide it later — blanks are never defaulted,",
+        "and a row with any bad value changes nothing at all.",
         "Then: annotate.py apply <corpus> %s" % result["out_path"],
     ]
     if result["unindexed"]:
@@ -255,8 +327,8 @@ def format_apply(result: dict) -> str:
         lines.append("    %s" % item)
     lines.append("")
     lines.append(
-        "Nothing here touched a `verified` date. Classifying a chunk is not "
-        "the same act as checking it, and this tool never conflates them."
+        "A `verified` date was written only where you supplied one. "
+        "Classifying a chunk is not the same act as checking it."
     )
     return "\n".join(lines)
 

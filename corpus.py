@@ -104,6 +104,10 @@ class Chunk:
     # — on a corpus of coded titles the second kind is worthless, and the two
     # are indistinguishable once written into the same field.
     topics_basis: str | None = None
+    # Which boundary rule produced this chunk. Carried because a task-statement
+    # chunk is far coarser than one lesson, and a cross-course search that hid
+    # the difference would present unlike things as comparable.
+    split_by: str | None = None
 
     @property
     def depth_is_unreviewed(self) -> bool:
@@ -252,6 +256,7 @@ def load_chunk(path: str, text: str) -> Chunk | Problem:
         source=fields.get("source", "").strip() or None,
         title=fields.get("title", "").strip() or None,
         topics_basis=fields.get("topics_basis", "").strip() or None,
+        split_by=fields.get("split_by", "").strip() or None,
     )
 
 
@@ -440,6 +445,8 @@ def format_search(result: SearchResult) -> str:
                 extra.append("%g min" % chunk.duration_min)
             if chunk.source:
                 extra.append("from %s" % chunk.source)
+            if chunk.split_by and chunk.split_by != "lesson-duration":
+                extra.append("whole %s" % chunk.split_by.replace("-", " "))
             lines.append("      %s" % "   ".join(extra))
             lines.append("")
 

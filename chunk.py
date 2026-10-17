@@ -47,6 +47,27 @@ LESSON_HEADING = re.compile(
 # Written into every chunk. corpus.py indexes this and flags it on each hit.
 UNREVIEWED = "unreviewed"
 
+# A second boundary shape. MEASURED 2026-10-17 across four exam-prep scripts:
+# the parenthesised-duration heading exists in ONE of them (62 lessons) and in
+# none of the other three, which would make the splitter refuse them entirely.
+# `Task Statement` is the only boundary present in all four, and it is also the
+# unit the exam guide uses -- so it is what makes a cross-course search
+# comparable rather than merely possible.
+TASK_STATEMENT = re.compile(r"^Task Statement\b.*$")
+
+# MEASURED 2026-10-17: every script opens with a contents list where task
+# statements sit on CONSECUTIVE lines, then repeats them later as real section
+# headings. The gap distribution is cleanly bimodal -- 1 line apart in the list,
+# 5 or more apart for real sections (DEA gaps: 1,1,1,1,6,32,37...; DOP:
+# 1x8,5,8,12...; DVA: 1x5,16,21,24...). So this threshold separates the two
+# populations rather than trading them off, and any value from 2 to 5 gives the
+# same answer. 3 is the smallest that removes every consecutive-run entry.
+#
+# Splitting on the list entries would produce one-line chunks carrying a real
+# task statement's title and none of its content -- which would then read as
+# genuine coverage of that task statement.
+MIN_SECTION_LINES = 3
+
 _SLUG_STRIP = re.compile(r"[^a-z0-9]+")
 
 
@@ -78,6 +99,41 @@ def slugify(title: str, taken: set[str]) -> str:
         suffix += 1
     taken.add(slug)
     return slug
+
+
+def find_task_statements(text: str) -> tuple[tuple[Lesson, ...], int]:
+    """Split text at Task Statement headings, skipping contents-list entries.
+
+    Returns the same Lesson shape as find_lessons, with duration_min 0.0 because
+    these documents state no per-section duration. 0.0 is rendered as an EMPTY
+    duration field rather than as a zero, because "not stated" and "zero
+    minutes" are different claims.
+    """
+    lines = text.splitlines()
+    marks = [i for i, line in enumerate(lines) if TASK_STATEMENT.match(line)]
+    if not marks:
+        return (), len(lines)
+
+    real: list[int] = []
+    for position, index in enumerate(marks):
+        following = marks[position + 1] if position + 1 < len(marks) else len(lines)
+        if following - index >= MIN_SECTION_LINES:
+            real.append(index)
+    if not real:
+        return (), len(lines)
+
+    sections: list[Lesson] = []
+    for position, index in enumerate(real):
+        end = real[position + 1] if position + 1 < len(real) else len(lines)
+        sections.append(
+            Lesson(
+                title=lines[index].strip(),
+                duration_min=0.0,
+                start_line=index + 1,
+                body="\n".join(lines[index + 1 : end]).strip("\n"),
+            )
+        )
+    return tuple(sections), real[0]
 
 
 def find_lessons(text: str) -> tuple[tuple[Lesson, ...], int]:
@@ -226,7 +282,8 @@ def topics_for(lesson: Lesson, limit: int = 6) -> tuple[str, str]:
 
 
 def render_chunk(
-    lesson: Lesson, written: str, audience: str, source: str
+    lesson: Lesson, written: str, audience: str, source: str,
+    split_by: str = "lesson-duration",
 ) -> str:
     """Build one chunk file's text. `verified` is deliberately empty (rule 3)."""
     topics_line, basis = topics_for(lesson)
@@ -238,11 +295,15 @@ def render_chunk(
         "audience: %s" % audience,
         "written: %s" % written,
         "verified:",
+        # An unstated duration is EMPTY, never 0. "Not stated" and "zero
+        # minutes" are different claims, and a zero would skew any total.
         "duration_min: %s" % (
-            int(lesson.duration_min)
+            "" if not lesson.duration_min
+            else int(lesson.duration_min)
             if lesson.duration_min == int(lesson.duration_min)
             else lesson.duration_min
         ),
+        "split_by: %s" % split_by,
         "source: %s" % source,
         "title: %s" % lesson.title,
         "---",
@@ -287,10 +348,14 @@ def chunk_file(
             ),
         )
 
-    if not re.match(r"^\d{4}-\d{2}-\d{2}$", written):
+    # A YEAR is accepted here where `verified` demands a full date: nothing
+    # computes with `written`, it is displayed. Demanding precision nobody
+    # has would get it invented, which is worse than coarse truth.
+    if not re.match(r"^\d{4}(-\d{2}(-\d{2})?)?$", written):
         return Refusal(
             error="written_date_invalid",
-            message="--written must be YYYY-MM-DD, got %r." % written,
+            message="--written must be YYYY, YYYY-MM or YYYY-MM-DD, got %r."
+            % written,
             guidance=(
                 "Pass the date the SOURCE content was written, not today's "
                 "date. Today's date would restate old material as new, and it "
@@ -323,12 +388,21 @@ def chunk_file(
         )
 
     lessons, preamble_lines = find_lessons(text)
+    split_by = "lesson-duration"
+    if not lessons:
+        # Fall back to the only boundary shared by every script measured. The
+        # fallback is RECORDED in each chunk rather than inferred later: a
+        # task-statement chunk is far coarser than a lesson, and a cross-course
+        # search that hid the difference would compare unlike things.
+        lessons, preamble_lines = find_task_statements(text)
+        split_by = "task-statement"
     if not lessons:
         return Refusal(
             error="no_lesson_boundaries",
             message=(
-                "Found no lesson headings in %s. This splitter looks for a "
-                "heading line ending in a parenthesised duration." % source_path
+                "Found no boundaries in %s. This splitter looks for a heading "
+                "line ending in a parenthesised duration, then for lines "
+                "beginning 'Task Statement'." % source_path
             ),
             guidance=(
                 "Check the export kept its headings, or split this document by "
@@ -350,7 +424,9 @@ def chunk_file(
         if not dry_run:
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(
-                    render_chunk(lesson, written, audience, source_name)
+                    render_chunk(
+                        lesson, written, audience, source_name, split_by
+                    )
                 )
         written_files.append((path, lesson.duration_min))
 
@@ -358,6 +434,7 @@ def chunk_file(
         "source": source_path,
         "out_dir": out_dir,
         "lessons": len(lessons),
+        "split_by": split_by,
         "total_minutes": round(sum(l.duration_min for l in lessons), 1),
         "preamble_lines_not_chunked": preamble_lines,
         "files": written_files,
@@ -371,7 +448,12 @@ def format_result(result: dict) -> str:
         % ("Would write" if result["dry_run"] else "Wrote", result["lessons"],
            result["source"]),
         "Destination: %s" % result["out_dir"],
-        "Stated duration: %s minutes total" % result["total_minutes"],
+        "Split at: %s boundaries" % result["split_by"],
+        "Stated duration: %s" % (
+            "%s minutes total" % result["total_minutes"]
+            if result["total_minutes"]
+            else "not stated in this document"
+        ),
     ]
     if result["preamble_lines_not_chunked"]:
         lines.append(

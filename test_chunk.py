@@ -309,3 +309,103 @@ class TestDerivedTopics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTaskStatementFallback(unittest.TestCase):
+    """The second boundary rule, and the contents-list trap it avoids.
+
+    MEASURED 2026-10-17 across four exam-prep scripts: the parenthesised
+    duration heading exists in ONE and in none of the other three. Each of
+    those three opens with a contents list where task statements sit on
+    CONSECUTIVE lines and are then repeated later as real section headings.
+    """
+
+    SCRIPT = (
+        "Course front matter.\n"
+        "Task Statement 1.1: Implement pipelines.\n"   # contents list entry
+        "Task Statement 1.2: Integrate testing.\n"      # contents list entry
+        "Task Statement 1.3: Manage artifacts.\n"       # contents list entry
+        "\n"
+        "Task Statement 1.1: Implement pipelines.\n"    # the real section
+        "Real narration about pipelines.\n"
+        "More narration.\n"
+        "Another line.\n"
+        "Task Statement 1.2: Integrate testing.\n"      # the real section
+        "Narration about testing.\n"
+        "Second line.\n"
+        "Third line.\n"
+    )
+
+    def test_contents_list_entries_are_not_treated_as_sections(self):
+        sections, _ = chunk.find_task_statements(self.SCRIPT)
+        # Three list entries plus two real sections = five raw markers; only
+        # the two real ones survive. Splitting on a list entry would produce a
+        # one-line chunk carrying a real task statement's TITLE and none of its
+        # content, which would then read as genuine coverage of it.
+        self.assertEqual(len(sections), 2)
+        for section in sections:
+            self.assertGreater(len(section.body.strip()), 20)
+
+    def test_unstated_duration_is_zero_and_renders_empty(self):
+        sections, _ = chunk.find_task_statements(self.SCRIPT)
+        self.assertEqual(sections[0].duration_min, 0.0)
+        rendered = chunk.render_chunk(
+            sections[0], "2024", "exam candidates", "DOP.txt", "task-statement"
+        )
+        # "Not stated" and "zero minutes" are different claims; a 0 here would
+        # be counted into any total.
+        self.assertIn("duration_min: \n", rendered)
+        self.assertNotIn("duration_min: 0", rendered)
+
+    def test_split_by_is_recorded_in_the_chunk(self):
+        sections, _ = chunk.find_task_statements(self.SCRIPT)
+        rendered = chunk.render_chunk(
+            sections[0], "2024", "exam candidates", "DOP.txt", "task-statement"
+        )
+        self.assertIn("split_by: task-statement", rendered)
+        loaded = corpus.load_chunk("x.md", rendered)
+        self.assertEqual(loaded.split_by, "task-statement")
+        self.assertIsNone(loaded.duration_min)
+
+    def test_lesson_rule_wins_when_both_shapes_are_present(self):
+        both = "Intro (5 minutes)\nNarration.\n" + self.SCRIPT
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            src = os.path.join(tmp.name, "c.txt")
+            with open(src, "w", encoding="utf-8") as handle:
+                handle.write(both)
+            result = chunk.chunk_file(
+                source_path=src,
+                out_dir=os.path.join(tmp.name, "out"),
+                written="2024",
+                audience="x",
+            )
+            self.assertEqual(result["split_by"], "lesson-duration")
+        finally:
+            tmp.cleanup()
+
+    def test_a_year_only_written_date_is_accepted(self):
+        # Years are what the author actually remembers. Nothing computes with
+        # `written`, so demanding a day would get one invented.
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            src = os.path.join(tmp.name, "c.txt")
+            with open(src, "w", encoding="utf-8") as handle:
+                handle.write(self.SCRIPT)
+            for date in ("2024", "2024-06", "2024-06-01"):
+                result = chunk.chunk_file(
+                    source_path=src,
+                    out_dir=os.path.join(tmp.name, "out-" + date),
+                    written=date,
+                    audience="x",
+                )
+                self.assertNotIsInstance(result, chunk.Refusal, date)
+            bad = chunk.chunk_file(
+                source_path=src,
+                out_dir=os.path.join(tmp.name, "bad"),
+                written="last year",
+                audience="x",
+            )
+            self.assertIsInstance(bad, chunk.Refusal)
+        finally:
+            tmp.cleanup()

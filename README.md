@@ -156,25 +156,44 @@ It also **refuses to write into a git working tree** unless you pass
 `--allow-in-git-repo`. Course content does not belong in a repository, and a
 `.gitignore` entry is a convention where this is a check.
 
-## A measured limitation you will hit immediately
+## Where topics come from, and why not from the title
 
-Derived topics are only as good as your lesson titles, and on a real exam-prep
-script they were mostly useless.
+Topics are extracted from each lesson's **body** by a general scan, and the title
+is only a fallback. That ordering was forced by a measurement.
 
-Measured on a 62-lesson course: **57 of 62 titles were structural codes** —
-`Domain 2 introduction`, `TS 4.3 part 2`, `Module 1: Course introduction` — which
-derive to topics like `domain` and `module`. Only 5 titles named their subject
-("Machine Learning Lifecycle", "Types of machine learning"). So a search for a
-real topic matched on body text rather than on topics for almost every hit, and a
-broad term matched 56 of 62 chunks: the forty-equally-weighted-hits problem this
-tool is supposed to solve, reproduced inside it.
+Titles were tried first and were nearly useless. On a 62-lesson course, **57 of 62
+titles were structural codes** — `Domain 2 introduction`, `TS 4.3 part 2`,
+`Module 1: Course introduction` — which restate to topics like `domain` and
+`module`. Only 5 named their subject. A broad search then matched 56 of 62 chunks
+on body text alone: the forty-equally-weighted-hits problem this tool exists to
+solve, reproduced inside the tool.
 
-The honest reading: after splitting, the corpus is **indexed and not yet useful**.
-Two things close the gap, and neither is automatable. Topics have to come from
-something other than the title — the services and concepts the body names, or the
-curriculum document the codes refer to. And depth has to be set by a person, 62
-times. The tool is built to make that state visible rather than to pretend it has
-been done.
+Extracting from the body instead took that from **5 usable topic lines to 58 of
+62**, with 4 still falling back to the title.
+
+The scan matches by **shape, not by a word list** — a hand-built list of product
+names misses whole families, misses every capitalised variant, and goes stale the
+moment something is renamed. Four patterns: `Amazon X` / `AWS X`, CamelCase in one
+token (`SageMaker`, `DynamoDB`), short all-caps with optional digits (`IAM`, `S3`),
+and hyphenated technical terms. Candidates are frequency-ranked, because a lesson
+that names something eleven times is about it and one that names it once is not,
+and overlapping matches are collapsed so `VPC` and `Amazon VPC` do not spend two
+of six slots on one topic.
+
+Each chunk records **`topics_basis`** — `extracted-from-body` or
+`restated-from-title` — and a search flags the second kind, because on a corpus of
+coded titles those topics are worthless and the two are indistinguishable once
+written into the same field.
+
+Extraction is allowed where depth inference is not, and the distinction is the
+point: extraction reports what the text says and fails in the harmless direction,
+costing a noisy search hit. An inferred depth would fail in the flattering one,
+producing a corpus that looks fully classified by nobody.
+
+**It is still not finished after splitting.** Depth has to be set by a person,
+once per chunk, and the scan picks up some adjectives (`cost-efficient`,
+`real-time`) alongside real subjects. The tool is built to make that state visible
+rather than to pretend the work has been done.
 
 ## Design rules
 

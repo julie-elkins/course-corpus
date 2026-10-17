@@ -99,6 +99,11 @@ class Chunk:
     duration_min: float | None = None
     source: str | None = None
     title: str | None = None
+    # How the topics line was arrived at. Carried so a reader can tell a topic
+    # extracted from the lesson's own text from one merely restated off a title
+    # — on a corpus of coded titles the second kind is worthless, and the two
+    # are indistinguishable once written into the same field.
+    topics_basis: str | None = None
 
     @property
     def depth_is_unreviewed(self) -> bool:
@@ -246,6 +251,7 @@ def load_chunk(path: str, text: str) -> Chunk | Problem:
         duration_min=duration,
         source=fields.get("source", "").strip() or None,
         title=fields.get("title", "").strip() or None,
+        topics_basis=fields.get("topics_basis", "").strip() or None,
     )
 
 
@@ -428,6 +434,8 @@ def format_search(result: SearchResult) -> str:
                 % (chunk.written, chunk.verified or "never", hit.currency)
             )
             extra = ["matched on %s" % where]
+            if chunk.topics_basis == "restated-from-title":
+                extra.append("topics only restated from the title")
             if chunk.duration_min is not None:
                 extra.append("%g min" % chunk.duration_min)
             if chunk.source:

@@ -123,23 +123,117 @@ def derive_topics(title: str) -> str:
     like "What is machine learning?" yields "machine learning" rather than four
     useless terms. The author is expected to correct it; the README says so.
     """
-    stop = {
-        "a", "an", "and", "are", "as", "at", "by", "для", "for", "from", "how",
-        "in", "into", "is", "of", "on", "or", "part", "the", "to", "what",
-        "with", "your", "you", "introduction", "intro", "overview",
+    # Shares _NOT_A_TOPIC rather than keeping a second list. MEASURED
+    # 2026-10-17: with two separate stoplists, the title "TS 2.2 part 1"
+    # derived to the topic "ts" — the scan already excluded "ts" and the title
+    # path did not, so one code path filtered a term the other emitted. Two
+    # lists of the same thing drift, and the drift shows up as a junk topic.
+    stop = _NOT_A_TOPIC | {
+        "an", "are", "as", "at", "by", "from", "into", "is", "of", "on", "to",
+        "introduction", "intro", "overview", "course", "lesson",
     }
     words = [w for w in _SLUG_STRIP.sub(" ", title.lower()).split() if w]
     kept = [w for w in words if w not in stop and not w.isdigit()]
     return ", ".join(kept[:6]) if kept else title.lower()
 
 
+# A GENERAL SCAN, not a word list. A hand-built list of service names misses
+# whole families and every capitalised variant, and it goes stale the moment a
+# product is renamed. These four patterns match by SHAPE instead:
+#   "Amazon X" / "AWS X"  — the product-naming convention
+#   CamelCase in one token — SageMaker, CloudWatch, DynamoDB
+#   short all-caps        — S3, IAM, ETL, KMS
+#   hyphenated technical terms — hyperparameter-tuning, cross-validation
+_NAMED = (
+    re.compile(r"\b(?:Amazon|AWS)\s+[A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*){0,2}"),
+    re.compile(r"\b[A-Z][a-z]+[A-Z][A-Za-z0-9]*\b"),
+    # Two alternatives, because requiring two or more capitals missed S3 —
+    # MEASURED 2026-10-17, "s3" absent from a body that named it. A single
+    # capital followed by digits is a real naming shape (S3, M5), and matching
+    # a lone capital with no digits would pull in every "I" and "A".
+    re.compile(r"\b(?:[A-Z]{2,6}\d{0,2}|[A-Z]\d{1,2})\b"),
+    re.compile(r"\b[a-z]{4,}-[a-z]{4,}(?:-[a-z]{4,})?\b"),
+)
+
+# Shapes the scan matches that are never a topic. Deliberately tiny: this is a
+# list of SCAN ARTEFACTS, not a list of domain vocabulary. Growing it with real
+# subject terms would turn the scan back into a hand-list.
+_NOT_A_TOPIC = {
+    "aws", "amazon", "i", "ts", "x", "a", "the", "and", "or", "if", "in", "it",
+    "slide", "x-slide", "module", "domain", "part", "ok", "so", "now", "next",
+    "first", "second", "third", "finally", "here", "this", "that", "you",
+    "your", "we", "us", "let", "also", "but", "for", "with", "when", "what",
+    "how", "why", "tbd", "faq", "q", "version", "free", "paid", "minutes",
+}
+
+
+def extract_topics(body: str, limit: int = 6) -> list[str]:
+    """Pull candidate topics out of a lesson body by scanning for named things.
+
+    Frequency-ranked, because a lesson that says SageMaker eleven times is about
+    SageMaker and one that says it once is not. Ties break on first appearance,
+    so the ordering is stable across runs rather than depending on dict order.
+
+    This is EXTRACTION, not classification — the same reason title restatement
+    was allowed where depth inference was not. It reports what the text says, and
+    it can be wrong in the harmless direction (a noisy topic costs a bad search
+    hit) rather than the flattering one (a guessed depth costs a false verdict).
+    """
+    counts: dict[str, int] = {}
+    order: dict[str, int] = {}
+    for pattern in _NAMED:
+        for match in pattern.finditer(body):
+            term = match.group(0).strip()
+            key = term.lower()
+            if key in _NOT_A_TOPIC or len(key) < 2:
+                continue
+            if key.isdigit():
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            order.setdefault(key, match.start())
+
+    ranked = sorted(counts, key=lambda k: (-counts[k], order[k]))
+
+    # Drop near-duplicates that the overlapping patterns produce: "Amazon VPC"
+    # and "VPC" both match, and emitting both spends two of six slots on one
+    # topic. The higher-frequency form wins — it is the one the author actually
+    # uses, and for search the shorter form matches a superset of what the
+    # longer one would.
+    kept: list[str] = []
+    for candidate in ranked:
+        if any(candidate in k or k in candidate for k in kept):
+            continue
+        kept.append(candidate)
+        if len(kept) == limit:
+            break
+    return kept
+
+
+def topics_for(lesson: Lesson, limit: int = 6) -> tuple[str, str]:
+    """Return (topics_line, basis). Body extraction first, title as fallback.
+
+    MEASURED 2026-10-17: on a 62-lesson exam-prep script, 57 of 62 titles were
+    structural codes ("TS 4.3 part 2"), so title restatement produced topics like
+    "domain" and "module" and was useless for 92% of the corpus. The body is
+    where the subject actually is. `basis` is recorded in the chunk so a later
+    reader can tell which chunks have derived topics worth trusting.
+    """
+    extracted = extract_topics(lesson.body, limit=limit)
+    if extracted:
+        return ", ".join(extracted), "extracted-from-body"
+    fallback = derive_topics(lesson.title)
+    return fallback, "restated-from-title"
+
+
 def render_chunk(
     lesson: Lesson, written: str, audience: str, source: str
 ) -> str:
     """Build one chunk file's text. `verified` is deliberately empty (rule 3)."""
+    topics_line, basis = topics_for(lesson)
     header = [
         "---",
-        "topics: %s" % derive_topics(lesson.title),
+        "topics: %s" % topics_line,
+        "topics_basis: %s" % basis,
         "depth: %s" % UNREVIEWED,
         "audience: %s" % audience,
         "written: %s" % written,

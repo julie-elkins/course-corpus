@@ -229,6 +229,73 @@ class TestRefusesToWriteIntoAGitRepo(unittest.TestCase):
             plain.cleanup()
 
 
+class TestTopicExtraction(unittest.TestCase):
+    """Topics come from the body by a general scan, never a hand-built list."""
+
+    BODY = (
+        "In this lesson you will use Amazon SageMaker to train a model. "
+        "SageMaker handles the training job, and SageMaker Model Monitor "
+        "watches it afterwards. Store the data in S3 and grant access with "
+        "IAM. You will also see Amazon VPC configuration and VPC endpoints."
+    )
+
+    def test_extracts_named_services_from_the_body(self):
+        topics = chunk.extract_topics(self.BODY)
+        self.assertIn("sagemaker", topics)
+        self.assertIn("s3", topics)
+        self.assertIn("iam", topics)
+
+    def test_frequency_ranks_the_subject_first(self):
+        # SageMaker appears three times; S3 and IAM once each. A lesson that
+        # says a name repeatedly is about it.
+        self.assertEqual(chunk.extract_topics(self.BODY)[0], "sagemaker")
+
+    def test_overlapping_terms_do_not_both_take_a_slot(self):
+        topics = chunk.extract_topics(self.BODY)
+        # "vpc" and "amazon vpc" both match the patterns; only one survives,
+        # otherwise one topic spends two of six slots.
+        overlapping = [t for t in topics if "vpc" in t]
+        self.assertEqual(len(overlapping), 1)
+
+    def test_scan_artefacts_are_excluded(self):
+        for junk in ("aws", "amazon", "i", "x-slide", "module"):
+            self.assertNotIn(junk, chunk.extract_topics(self.BODY))
+
+    def test_body_with_no_named_things_falls_back_to_the_title(self):
+        lesson = chunk.Lesson(
+            title="Walkthrough example",
+            duration_min=5.0,
+            start_line=1,
+            body="we will go through it together step by step now.",
+        )
+        topics, basis = chunk.topics_for(lesson)
+        self.assertEqual(basis, "restated-from-title")
+        self.assertIn("walkthrough", topics)
+
+    def test_basis_is_recorded_so_weak_topics_are_identifiable(self):
+        strong = chunk.Lesson("TS 4.3 part 2", 6.0, 1, self.BODY)
+        _, basis = chunk.topics_for(strong)
+        self.assertEqual(basis, "extracted-from-body")
+
+    def test_the_two_stoplists_do_not_drift(self):
+        # Regression. MEASURED 2026-10-17: the title path emitted "ts" as a
+        # standalone topic while the scan path excluded it, because each kept
+        # its own list. A term excluded by one must be excluded by the other.
+        #
+        # Asserted on the comma-SPLIT list, not on the string: when every word
+        # of a title is a stopword, derive_topics deliberately falls back to the
+        # whole title as ONE topic rather than returning nothing, because an
+        # empty topics field makes the chunk unindexable and the content would
+        # disappear from search entirely. "ts 2.2 part 1" as a single weak
+        # topic is a different thing from "ts" as a topic in its own right.
+        emitted = [t.strip() for t in chunk.derive_topics("TS 2.2 part 1").split(",")]
+        self.assertNotIn("ts", emitted)
+        self.assertNotIn("ts", chunk.extract_topics("TS 2.2 covers this."))
+
+    def test_limit_is_respected(self):
+        self.assertLessEqual(len(chunk.extract_topics(self.BODY, limit=2)), 2)
+
+
 class TestDerivedTopics(unittest.TestCase):
     def test_topics_restate_the_title_without_stopwords(self):
         self.assertEqual(

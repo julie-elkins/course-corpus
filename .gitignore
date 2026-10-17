@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+venv/
+
+# Your own corpus does not belong in this repository. The tool takes a path to it;
+# keep the content wherever it already lives, outside version control here.
+my-corpus/
+corpus/
+content/
